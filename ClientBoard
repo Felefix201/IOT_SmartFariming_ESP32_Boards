@@ -1,0 +1,74 @@
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+const char* mqtt_server = "broker.mqtt-dashboard.com";
+const int clientMoisturePin = 32;
+const int dhtPin = 25;
+
+DHT dht(dhtPin, DHT22);
+WiFiClient espClient;
+PubSubClient client(espClient);
+String board_id;
+
+void setup() {
+  Serial.begin(115200);
+  
+  WiFiManager wifiManager;
+  wifiManager.autoConnect("AutoConnectAP_ClientBoard");
+  
+  Serial.println("Connected to WiFi");
+  
+  dht.begin();
+  client.setServer(mqtt_server, 1883);
+
+  String macPrefix = WiFi.macAddress().substring(0, 8);
+  
+  randomSeed(analogRead(0));
+  int randomNum = random(1000, 10000);
+  
+  board_id = macPrefix + String(randomNum);
+  
+  Serial.println("Board ID: " + board_id);
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  sendSensorData();
+  delay(2000);
+}
+
+void sendSensorData() {
+  DynamicJsonDocument doc(256);
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+  int soilMoisture = analogRead(clientMoisturePin);
+
+  doc["Bodenfeuchtigkeit"] = soilMoisture;
+  doc["Luftfeuchtigkeit"] = humidity;
+  doc["Temperatur"] = temperature;
+  
+  String sensorData;
+  serializeJson(doc, sensorData);
+  
+  String topic = "sensordata/" + board_id;
+  client.publish(topic.c_str(), sensorData.c_str());
+
+  Serial.print("Gesendete Daten: ");
+  Serial.println(sensorData);
+}
+
+
+void reconnect() {
+  while (!client.connected()) {
+    if (client.connect(board_id.c_str())) {
+    } else {
+      delay(5000);
+    }
+  }
+}
