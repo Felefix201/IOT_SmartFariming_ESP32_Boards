@@ -1,0 +1,167 @@
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <DHT.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
+#include <map>  
+
+const char* mqtt_server = "broker.mqtt-dashboard.com";
+const int serverMoisturePin = 26;
+const int dhtPin = 25;
+
+DHT dht(dhtPin, DHT22);
+WiFiClient espClient;
+PubSubClient client(espClient);
+AsyncWebServer server(8086);
+DynamicJsonDocument dataJson(2048);
+std::map<String, int> clientPrefixes;  
+
+void setup() {
+  Serial.begin(115200);
+  if(!SPIFFS.begin(true)){
+    return;
+  }
+
+  WiFiManager wifiManager;    
+  wifiManager.autoConnect("AutoConnectAP_Server"); 
+  Serial.println("Connectet to WLAN System");
+  WiFi.setHostname("ESP32_SmartFarming_Server");
+  Serial.println(WiFi.localIP());
+
+  String macPrefix = WiFi.macAddress();
+  Serial.println(macPrefix);
+
+  dht.begin();
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json;
+    File file = SPIFFS.open("/data.json");
+    if(!file){
+        request->send(500, "text/plain", "Internal Server Error");
+        return;
+    }
+    while(file.available()){
+        json += (char)file.read();
+    }
+    file.close();
+    request->send(200, "application/json", json);
+  });
+
+  server.begin();  
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  updateServerData();
+  delay(2000);
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {  
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  String board_id = String(topic).substring(String(topic).lastIndexOf('/') + 1);
+  updateData(board_id, message);
+}
+
+void reconnect() {  
+  while (!client.connected()) {
+    if (client.connect("ServerBoard")) {
+      client.subscribe("sensordata/#");
+    } else {
+      delay(5000);
+    }
+  }
+}
+
+void updateServerData() {
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+  float soilMoisture = analogRead(serverMoisturePin);
+
+  bool isDataValid = true;
+  if (isnan(humidity) || isnan(temperature) || humidity < 0 || humidity > 100 || temperature < -40 || temperature > 80) {
+    isDataValid = false;
+  }
+  if (soilMoisture < 0 || soilMoisture > 1023) {
+    isDataValid = false;
+  }
+
+  String newData;
+  DynamicJsonDocument newDoc(256);
+  if (isDataValid) {
+    newDoc["Bodenfeuchtigkeit"] = soilMoisture;
+    newDoc["Luftfeuchtigkeit"] = humidity;
+    newDoc["Temperatur"] = temperature;
+  } else {
+    newDoc["Bodenfeuchtigkeit"] = "ERROR";
+    newDoc["Luftfeuchtigkeit"] = "ERROR";
+    newDoc["Temperatur"] = "ERROR";
+  }
+  serializeJson(newDoc, newData);
+
+  updateData("ServerBoard", newData);
+}
+
+void updateData(const String& board_id, const String& newData) {
+    DynamicJsonDocument newDoc(256);
+    deserializeJson(newDoc, newData);
+    
+    int prefix;
+    if (board_id == "ServerBoard") {
+        prefix = 1;  // Präfix für den Server ist 01
+    } else {
+        if (clientPrefixes.find(board_id) == clientPrefixes.end()) {
+            // Neues Client-Board, finde den nächsten verfügbaren Präfix
+            int maxPrefix = 1;
+            for (const auto& kv : clientPrefixes) {
+                if (kv.second > maxPrefix) {
+                    maxPrefix = kv.second;
+                }
+            }
+            prefix = maxPrefix + 1;
+            clientPrefixes[board_id] = prefix;
+        } else {
+            // Bestehendes Client-Board, verwende den gespeicherten Präfix
+            prefix = clientPrefixes[board_id];
+        }
+    }
+    
+    String prefixedBoardId = String(prefix) + board_id;
+    
+    for (JsonPair kv : newDoc.as<JsonObject>()) {
+        String key = kv.key().c_str();
+        float newValue = kv.value().as<float>();
+        float oldValue = dataJson[prefixedBoardId][key].as<float>();
+        float averagedValue = (newValue + oldValue) / 2;
+
+        Serial.print("Board: ");
+        Serial.print(prefixedBoardId);
+        Serial.print(", Key: ");
+        Serial.print(key);
+        Serial.print(", Value: ");
+        Serial.println(averagedValue);
+
+        dataJson[prefixedBoardId][key] = averagedValue;
+    }
+
+    File file = SPIFFS.open("/data.json", "w");
+    if (!file) {
+        Serial.println("Failed to open data.json for writing");
+        return;
+    }
+    serializeJson(dataJson, file);
+    file.close();
+}
+
